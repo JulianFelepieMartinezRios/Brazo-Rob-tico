@@ -1,0 +1,198 @@
+import network
+import socket
+import ujson as json
+import time
+import math
+from machine import Pin, I2C
+
+SSID = "BRAZO_ARM"
+PASSWORD = "12345678"
+BRAZO_IP = "192.168.4.1"
+BRAZO_PORT = 6000
+
+SDA_PIN = 21
+SCL_PIN = 22
+I2C_FREQ = 400000
+MPU_ADDR = 0x68
+REG_PWR_MGMT_1 = 0x6B
+REG_ACCEL_XOUT_H = 0x3B
+
+LED_PIN = 2
+
+MUESTRAS_PROMEDIO = 10
+PAUSA_ENTRE_MUESTRAS_MS = 1
+ENVIO_CADA_MS = 80
+
+BASE_CENTRO = 90
+HOMBRO_CENTRO = 90
+BASE_MIN = 0
+BASE_MAX = 180
+HOMBRO_MIN = 0
+HOMBRO_MAX = 180
+
+GANANCIA_BASE = 1.4
+GANANCIA_HOMBRO = 1.2
+
+class MPU6050:
+    def __init__(self, i2c, addr=MPU_ADDR):
+        self.i2c = i2c
+        self.addr = addr
+        self.i2c.writeto_mem(self.addr, REG_PWR_MGMT_1, b'\x00')
+        time.sleep_ms(100)
+
+    def _read_word(self, reg):
+        data = self.i2c.readfrom_mem(self.addr, reg, 2)
+        value = (data[0] << 8) | data[1]
+        if value & 0x8000:
+            value -= 65536
+        return value
+
+    def read_accel(self):
+        ax = self._read_word(REG_ACCEL_XOUT_H) / 16384.0
+        ay = self._read_word(REG_ACCEL_XOUT_H + 2) / 16384.0
+        az = self._read_word(REG_ACCEL_XOUT_H + 4) / 16384.0
+        return ax, ay, az
+
+def en_rango(x, a, b):
+    return a <= x <= b
+
+def conectar_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Conectando WiFi...")
+        wlan.connect(SSID, PASSWORD)
+        t0 = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), t0) > 15000:
+                raise RuntimeError("No se pudo conectar al WiFi")
+            time.sleep_ms(300)
+    print("WiFi OK:", wlan.ifconfig())
+
+def leer_accel_promedio(mpu, n=MUESTRAS_PROMEDIO, pausa_ms=PAUSA_ENTRE_MUESTRAS_MS):
+    sx = sy = sz = 0.0
+    for _ in range(n):
+        ax, ay, az = mpu.read_accel()
+        sx += ax
+        sy += ay
+        sz += az
+        time.sleep_ms(pausa_ms)
+    return sx / n, sy / n, sz / n
+
+def calcular_angulos(ax, ay, az):
+    roll = math.degrees(math.atan2(ay, az))
+    pitch = math.degrees(math.atan2(ax, math.sqrt(ay * ay + az * az)))
+    return roll, pitch
+
+def calibrar_offsets(mpu, bloques=80):
+    print("Calibrando...")
+    sroll = spitch = say = 0.0
+    for _ in range(bloques):
+        ax, ay, az = leer_accel_promedio(mpu)
+        roll, pitch = calcular_angulos(ax, ay, az)
+        sroll += roll
+        spitch += pitch
+        say += ay
+    return sroll / bloques, spitch / bloques, say / bloques
+
+class BrazoClient:
+    def __init__(self):
+        self.sock = None
+
+    def connect(self):
+        self.close()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect((BRAZO_IP, BRAZO_PORT))
+
+    def send_json(self, obj):
+        if self.sock is None:
+            raise RuntimeError("Sin conexión")
+        msg = json.dumps(obj) + "\n"
+        self.sock.send(msg.encode())
+
+        data = b""
+        while b"\n" not in data:
+            chunk = self.sock.recv(128)
+            if not chunk:
+                raise RuntimeError("Socket cerrado")
+            data += chunk
+        return data.decode().strip()
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except:
+            pass
+        self.sock = None
+
+def main():
+    led = Pin(LED_PIN, Pin.OUT)
+    led.off()
+
+    try:
+        conectar_wifi()
+    except Exception as e:
+        print("WiFi error:", e)
+        led.on()
+        return
+
+    try:
+        i2c = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=I2C_FREQ)
+        print("I2C:", i2c.scan())
+        mpu = MPU6050(i2c)
+    except Exception as e:
+        print("MPU error:", e)
+        led.on()
+        return
+
+    try:
+        roll0, pitch0, ay0 = calibrar_offsets(mpu)
+        print("Offsets:", roll0, pitch0, ay0)
+    except Exception as e:
+        print("Calibración error:", e)
+        led.on()
+        return
+
+    client = BrazoClient()
+
+    while True:
+        try:
+            if client.sock is None:
+                print("Reconectando brazo...")
+                client.connect()
+                print(client.send_json({"ping": True}))
+
+            ax, ay, az = leer_accel_promedio(mpu)
+            roll, pitch = calcular_angulos(ax, ay, az)
+
+            d_pitch = pitch - pitch0
+            d_ay = ay - ay0
+
+            base = int(BASE_CENTRO - (d_ay * 90 * GANANCIA_BASE))
+            hombro = int(HOMBRO_CENTRO + (d_pitch * GANANCIA_HOMBRO))
+
+            if not en_rango(base, BASE_MIN, BASE_MAX) or not en_rango(hombro, HOMBRO_MIN, HOMBRO_MAX):
+                led.on()
+                print("Fuera de rango:", base, hombro)
+                time.sleep_ms(ENVIO_CADA_MS)
+                continue
+
+            resp = client.send_json({"tipo": "mpu", "base": base, "hombro": hombro})
+
+            if "ERROR" in resp:
+                print("RX:", resp)
+                led.on()
+            else:
+                led.off()
+
+            time.sleep_ms(ENVIO_CADA_MS)
+
+        except Exception as e:
+            print("Loop error:", e)
+            led.on()
+            client.close()
+            time.sleep_ms(1000)
+
+main()
