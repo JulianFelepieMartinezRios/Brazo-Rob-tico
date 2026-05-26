@@ -1,0 +1,237 @@
+import network
+import socket
+import ujson as json
+import time
+import _thread
+from machine import Pin, PWM
+
+AP_SSID = "BRAZO_ARM"
+AP_PASS = "12345678"
+AP_IP = "192.168.4.1"
+AP_MASK = "255.255.255.0"
+PORT = 6000
+
+SERVO_PINS = [13, 12, 14, 27, 26]
+NUM_SERVOS = 5
+
+LIMITES = [
+    (0, 180),
+    (0, 180),
+    (0, 180),
+    (0, 180),
+    (0, 90),
+]
+
+POS_INICIALES = [90, 90, 90, 90, 45]
+
+SERVO_FREQ = 50
+MIN_US = 500
+MAX_US = 2500
+DELTA_MIN = [2, 2, 2, 2, 1]
+
+modo_actual = "manual"
+angulos = POS_INICIALES[:]
+servos = []
+lock = _thread.allocate_lock()
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def angle_to_duty(angle):
+    angle = clamp(angle, 0, 180)
+    us = MIN_US + (MAX_US - MIN_US) * angle / 180.0
+    return int(us * 1023 * SERVO_FREQ / 1000000)
+
+def set_servo(i, angle, force=False):
+    global angulos
+    lo, hi = LIMITES[i]
+    angle = int(clamp(angle, lo, hi))
+
+    lock.acquire()
+    try:
+        if not force and abs(angle - angulos[i]) < DELTA_MIN[i]:
+            return False
+        angulos[i] = angle
+        servos[i].duty(angle_to_duty(angle))
+        return True
+    finally:
+        lock.release()
+
+def set_all(vals, force=False):
+    movidos = 0
+    for i in range(min(NUM_SERVOS, len(vals))):
+        if set_servo(i, vals[i], force):
+            movidos += 1
+            time.sleep_ms(10)
+    return movidos
+
+def init_servos():
+    global servos
+    servos = []
+    for pin in SERVO_PINS:
+        servos.append(PWM(Pin(pin), freq=SERVO_FREQ, duty=0))
+    time.sleep_ms(300)
+    set_all(POS_INICIALES, force=True)
+
+def iniciar_ap():
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    try:
+        ap.config(essid=AP_SSID, password=AP_PASS, authmode=network.AUTH_WPA_WPA2_PSK)
+    except:
+        ap.config(essid=AP_SSID, password=AP_PASS)
+    try:
+        ap.ifconfig((AP_IP, AP_MASK, AP_IP, AP_IP))
+    except:
+        pass
+    while not ap.active():
+        time.sleep_ms(100)
+    print("AP activo:", ap.ifconfig())
+
+def estado_actual():
+    lock.acquire()
+    try:
+        return json.dumps({"modo": modo_actual, "angulos": angulos})
+    finally:
+        lock.release()
+
+def procesar(obj):
+    global modo_actual
+
+    if not isinstance(obj, dict):
+        return "ERROR: formato invalido"
+
+    if obj.get("ping") is True:
+        return "OK"
+
+    tipo = obj.get("tipo", "")
+
+    if tipo == "config":
+        modo = str(obj.get("modo", "")).lower().strip()
+        if modo in ("manual", "mpu"):
+            lock.acquire()
+            try:
+                modo_actual = modo
+            finally:
+                lock.release()
+            return "MODO=" + modo.upper()
+        return "ERROR: modo invalido"
+
+    if tipo == "estado":
+        return estado_actual()
+
+    lock.acquire()
+    try:
+        modo = modo_actual
+    finally:
+        lock.release()
+
+    if tipo == "manual":
+        if modo != "manual":
+            return "IGNORADO: modo MPU activo"
+
+        if "servo" in obj and "angulo" in obj:
+            try:
+                s = int(obj["servo"]) - 1
+                a = int(obj["angulo"])
+            except:
+                return "ERROR: servo/angulo invalidos"
+
+            if 0 <= s < NUM_SERVOS:
+                ok = set_servo(s, a)
+                return "OK" if ok else "SIN_CAMBIO"
+            return "ERROR: servo invalido"
+
+        if "angulos" in obj and isinstance(obj["angulos"], list):
+            mov = set_all(obj["angulos"])
+            return "OK" if mov > 0 else "SIN_CAMBIO"
+
+        return "ERROR: comando manual invalido"
+
+    if tipo == "mpu":
+        if modo != "mpu":
+            return "IGNORADO: modo MANUAL activo"
+
+        mov = 0
+        try:
+            if "base" in obj and set_servo(0, int(obj["base"])):
+                mov += 1
+            if "hombro" in obj and set_servo(1, int(obj["hombro"])):
+                mov += 1
+            if "codo" in obj and set_servo(2, int(obj["codo"])):
+                mov += 1
+            if "muñeca" in obj and set_servo(3, int(obj["muñeca"])):
+                mov += 1
+            if "pinza" in obj and set_servo(4, int(obj["pinza"])):
+                mov += 1
+        except:
+            return "ERROR: datos MPU invalidos"
+
+        return "OK" if mov > 0 else "SIN_CAMBIO"
+
+    return "ERROR: comando no reconocido"
+
+def leer_linea(sock):
+    data = b""
+    while True:
+        chunk = sock.recv(128)
+        if not chunk:
+            return None
+        data += chunk
+        if b"\n" in data:
+            line, _ = data.split(b"\n", 1)
+            return line.decode().strip()
+
+def atender_cliente(cl, addr):
+    print("Cliente conectado:", addr)
+    try:
+        cl.settimeout(60)
+        while True:
+            linea = leer_linea(cl)
+            if linea is None:
+                break
+            if not linea:
+                continue
+
+            try:
+                obj = json.loads(linea)
+                resp = procesar(obj)
+            except:
+                resp = "ERROR: JSON invalido"
+
+            try:
+                cl.send((resp + "\n").encode())
+            except:
+                break
+    except Exception as e:
+        print("Cliente error:", addr, e)
+    finally:
+        try:
+            cl.close()
+        except:
+            pass
+        print("Cliente desconectado:", addr)
+
+def servidor():
+    addr = socket.getaddrinfo("0.0.0.0", PORT)[0][-1]
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(addr)
+    s.listen(5)
+    print("Servidor en puerto", PORT)
+
+    while True:
+        try:
+            cl, remote = s.accept()
+            _thread.start_new_thread(atender_cliente, (cl, remote))
+        except Exception as e:
+            print("Error accept:", e)
+            time.sleep_ms(100)
+
+def main():
+    print("Iniciando brazo...")
+    iniciar_ap()
+    init_servos()
+    servidor()
+
+main()
