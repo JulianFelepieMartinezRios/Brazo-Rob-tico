@@ -1,0 +1,536 @@
+import socket
+import json
+import threading
+import queue
+import time
+import tkinter as tk
+from tkinter import messagebox
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+CEREBRO_IP = "192.168.4.1"
+CEREBRO_PORT = 6000
+NUM_SERVOS = 5
+
+NOMBRES_SERVOS = ["Base", "Hombro", "Codo", "Muñeca", "Pinza"]
+LIMITES_SERVOS = [(0,180), (0,180), (0,180), (0,180), (0,90)]
+VALORES_INICIALES = [90,90,90,90,45]
+SLIDER_DEBOUNCE_MS = 80
+RECONNECT_MS = 2000
+
+BG_MAIN = "#000000"
+BG_PANEL = "#101010"
+BG_WIDGET = "#1b1b1b"
+BG_LOG = "#050505"
+FG_MAIN = "#ffffff"
+FG_SOFT = "#d0d0d0"
+ACCENT_RED = "#ff4d4d"
+ACCENT_ORANGE = "#ffb347"
+ACCENT_GREEN = "#00ff99"
+ACCENT_BLUE = "#4da6ff"
+ACCENT_PURPLE = "#c77dff"
+ACCENT_YELLOW = "#ffd166"
+GRID_COLOR = "#303030"
+BORDER_COLOR = "#404040"
+
+H_BASE = 0.8
+L_UPPER = 3.0
+L_FORE = 2.5
+L_WRIST = 1.5
+L_GRIP = 0.5
+TOTAL = H_BASE + L_UPPER + L_FORE + L_WRIST + L_GRIP + 0.5
+
+def forward_kinematics(angles):
+    phi = np.radians(angles[0])
+    alpha = np.radians(angles[1] - 90)
+    beta = np.radians(angles[2] - 90)
+    gamma = np.radians(angles[3] - 90)
+    grip = max(0, min(90, angles[4]))
+
+    def arm_vec(a):
+        return np.array([np.cos(a)*np.cos(phi), np.cos(a)*np.sin(phi), np.sin(a)])
+
+    p0 = np.array([0.0, 0.0, 0.0])
+    p1 = np.array([0.0, 0.0, H_BASE])
+    a1 = alpha
+    p2 = p1 + L_UPPER * arm_vec(a1)
+    a2 = a1 + beta
+    p3 = p2 + L_FORE * arm_vec(a2)
+    a3 = a2 + gamma
+    p4 = p3 + L_WRIST * arm_vec(a3)
+
+    perp = np.array([-np.sin(phi), np.cos(phi), 0.0])
+    arm_dir = arm_vec(a3)
+    gap = (grip / 90.0) * (L_GRIP * 0.8)
+
+    g1a = p4 + perp * gap
+    g1b = g1a + arm_dir * L_GRIP
+    g2a = p4 - perp * gap
+    g2b = g2a + arm_dir * L_GRIP
+
+    return {"joints": [p0, p1, p2, p3, p4], "gripper": [(g1a, g1b), (g2a, g2b)]}
+
+class PersistentClient:
+    def __init__(self, host, port, rx_queue):
+        self.host = host
+        self.port = port
+        self.rx_queue = rx_queue
+        self.sock = None
+        self.file = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.stop_flag = False
+        self.connected = False
+        self.reader_thread = None
+        self.manager_thread = None
+
+    def start(self):
+        self.stop_flag = False
+        if self.manager_thread is None or not self.manager_thread.is_alive():
+            self.manager_thread = threading.Thread(target=self._manager_loop, daemon=True)
+            self.manager_thread.start()
+
+    def _manager_loop(self):
+        while not self.stop_flag:
+            if not self.connected:
+                try:
+                    self._connect_once()
+                    self.rx_queue.put(("status", "connected"))
+                except Exception as e:
+                    self.rx_queue.put(("log", f"Reconexión fallida: {e}"))
+                    time.sleep(RECONNECT_MS / 1000.0)
+                    continue
+            time.sleep(0.5)
+
+    def _connect_once(self):
+        self.close_socket_only()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock.connect((self.host, self.port))
+        self.file = self.sock.makefile("r", encoding="utf-8", newline="\n")
+        self.connected = True
+        self.running = True
+        self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self.reader_thread.start()
+
+    def _reader(self):
+        try:
+            while self.running and not self.stop_flag:
+                line = self.file.readline()
+                if not line:
+                    raise RuntimeError("Socket cerrado por servidor")
+                self.rx_queue.put(("resp", line.strip()))
+        except Exception as e:
+            self.rx_queue.put(("log", f"RX desconectado: {e}"))
+        finally:
+            self.connected = False
+            self.running = False
+            self.close_socket_only()
+            self.rx_queue.put(("status", "disconnected"))
+
+    def send(self, obj):
+        if not self.connected or not self.sock:
+            raise RuntimeError("Sin conexión TCP activa")
+        msg = json.dumps(obj) + "\n"
+        with self.lock:
+            self.sock.sendall(msg.encode())
+
+    def close_socket_only(self):
+        try:
+            if self.file:
+                self.file.close()
+        except:
+            pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except:
+            pass
+        self.file = None
+        self.sock = None
+
+    def stop(self):
+        self.stop_flag = True
+        self.running = False
+        self.connected = False
+        self.close_socket_only()
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Control Brazo Robótico — Manual / MPU")
+        self.configure(bg=BG_MAIN)
+        self.minsize(980, 640)
+
+        self.rx_queue = queue.Queue()
+        self.client = None
+        self.conectado = False
+        self.auto_reconnect = False
+        self.modo = tk.StringVar(value="manual")
+        self.valores = [tk.IntVar(value=VALORES_INICIALES[i]) for i in range(NUM_SERVOS)]
+        self.sliders = []
+        self.slider_jobs = [None] * NUM_SERVOS
+        self.ultimo_enviado = VALORES_INICIALES[:]
+
+        self._build_ui()
+        self._start_animation()
+        self.after(100, self._poll_queue)
+
+    def _build_ui(self):
+        self.left = tk.Frame(self, bg=BG_MAIN, width=390)
+        self.right = tk.Frame(self, bg=BG_MAIN)
+        self.left.pack(side="left", fill="y", padx=(10, 0), pady=10)
+        self.right.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        self.left.pack_propagate(False)
+
+        self._build_header()
+        self._build_conexion()
+        self._build_modo()
+        self._build_servos()
+        self._build_acciones()
+        self._build_log()
+        self._build_3d()
+        self._actualizar_estado_modo_visual()
+
+    def _build_header(self):
+        f = tk.Frame(self.left, bg=BG_PANEL, pady=8, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        f.pack(fill="x", pady=(0, 8))
+        tk.Label(f, text="🦾 Brazo Robótico", font=("Helvetica", 15, "bold"), fg=FG_MAIN, bg=BG_PANEL).pack()
+        tk.Label(f, text="Control TCP · Manual / MPU · Vista 3D", font=("Helvetica", 8), fg=FG_SOFT, bg=BG_PANEL).pack()
+
+    def _build_conexion(self):
+        f = tk.LabelFrame(self.left, text=" Conexión ", font=("Helvetica", 9, "bold"),
+                          fg=FG_MAIN, bg=BG_MAIN, bd=1, relief="solid", padx=8, pady=6)
+        f.pack(fill="x", pady=(0, 6))
+
+        row = tk.Frame(f, bg=BG_MAIN)
+        row.pack(fill="x")
+
+        tk.Label(row, text="IP:", fg=FG_MAIN, bg=BG_MAIN).pack(side="left")
+        self.ip_entry = tk.Entry(row, width=13, bg=BG_WIDGET, fg=FG_MAIN, insertbackground=FG_MAIN, relief="flat")
+        self.ip_entry.insert(0, CEREBRO_IP)
+        self.ip_entry.pack(side="left", padx=(4, 8))
+
+        tk.Label(row, text="Puerto:", fg=FG_MAIN, bg=BG_MAIN).pack(side="left")
+        self.port_entry = tk.Entry(row, width=6, bg=BG_WIDGET, fg=FG_MAIN, insertbackground=FG_MAIN, relief="flat")
+        self.port_entry.insert(0, str(CEREBRO_PORT))
+        self.port_entry.pack(side="left", padx=(4, 8))
+
+        self.btn_conn = tk.Button(row, text="Conectar", command=self._toggle_conexion,
+                                  bg=ACCENT_RED, fg=FG_MAIN, font=("Helvetica", 9, "bold"),
+                                  relief="flat", padx=8, cursor="hand2")
+        self.btn_conn.pack(side="left")
+
+        self.btn_estado = tk.Button(row, text="Estado", command=self._pedir_estado,
+                                    bg=BG_WIDGET, fg=FG_MAIN, font=("Helvetica", 9),
+                                    relief="flat", padx=8, cursor="hand2")
+        self.btn_estado.pack(side="left", padx=(6, 0))
+
+        self.lbl_estado = tk.Label(f, text="● Desconectado", fg=ACCENT_RED, bg=BG_MAIN, font=("Helvetica", 9, "bold"))
+        self.lbl_estado.pack(anchor="w", pady=(4, 0))
+
+    def _build_modo(self):
+        f = tk.LabelFrame(self.left, text=" Modo de control ", font=("Helvetica", 9, "bold"),
+                          fg=FG_MAIN, bg=BG_MAIN, bd=1, relief="solid", padx=8, pady=6)
+        f.pack(fill="x", pady=(0, 6))
+
+        row = tk.Frame(f, bg=BG_MAIN)
+        row.pack(fill="x")
+
+        tk.Radiobutton(row, text="Manual", variable=self.modo, value="manual",
+                       command=self._cambiar_modo_desde_ui, bg=BG_MAIN, fg=FG_MAIN,
+                       selectcolor=BG_WIDGET, activebackground=BG_MAIN,
+                       activeforeground=FG_MAIN, font=("Helvetica", 10, "bold")).pack(side="left", padx=(0, 12))
+
+        tk.Radiobutton(row, text="MPU", variable=self.modo, value="mpu",
+                       command=self._cambiar_modo_desde_ui, bg=BG_MAIN, fg=FG_MAIN,
+                       selectcolor=BG_WIDGET, activebackground=BG_MAIN,
+                       activeforeground=FG_MAIN, font=("Helvetica", 10, "bold")).pack(side="left")
+
+        self.lbl_modo_estado = tk.Label(f, text="Modo activo: MANUAL", fg=ACCENT_YELLOW,
+                                        bg=BG_MAIN, font=("Helvetica", 9, "bold"))
+        self.lbl_modo_estado.pack(anchor="w", pady=(6, 0))
+
+    def _build_servos(self):
+        f = tk.LabelFrame(self.left, text=" Servos ", font=("Helvetica", 9, "bold"),
+                          fg=FG_MAIN, bg=BG_MAIN, bd=1, relief="solid", padx=8, pady=6)
+        f.pack(fill="x", pady=(0, 6))
+
+        colores = [ACCENT_RED, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_BLUE, ACCENT_PURPLE]
+        for i in range(NUM_SERVOS):
+            row = tk.Frame(f, bg=BG_MAIN, pady=2)
+            row.pack(fill="x")
+
+            color = colores[i % len(colores)]
+            minimo, maximo = LIMITES_SERVOS[i]
+
+            tk.Label(row, text=f"{NOMBRES_SERVOS[i]}:", width=8, anchor="w",
+                     fg=color, bg=BG_MAIN, font=("Helvetica", 9, "bold")).pack(side="left")
+
+            sl = tk.Scale(row, from_=minimo, to=maximo, orient="horizontal",
+                          variable=self.valores[i], length=195, bg=BG_MAIN, fg=FG_MAIN,
+                          highlightthickness=0, troughcolor=BG_WIDGET, activebackground=color,
+                          command=lambda v, idx=i: self._on_slider(idx, v))
+            sl.pack(side="left")
+            self.sliders.append(sl)
+
+            tk.Label(row, textvariable=self.valores[i], width=4, fg=color, bg=BG_MAIN,
+                     font=("Courier", 10, "bold")).pack(side="left")
+            tk.Label(row, text="°", fg=FG_SOFT, bg=BG_MAIN).pack(side="left")
+
+    def _build_acciones(self):
+        f = tk.LabelFrame(self.left, text=" Acciones rápidas ", font=("Helvetica", 9, "bold"),
+                          fg=FG_MAIN, bg=BG_MAIN, bd=1, relief="solid", padx=8, pady=6)
+        f.pack(fill="x", pady=(0, 6))
+
+        filas = [
+            [("⊙ Centro", self._centro), ("💤 Reposo", self._reposo)],
+            [("↑ Abrir pinza", self._abrir_pinza), ("↓ Cerrar pinza", self._cerrar_pinza)],
+        ]
+        for fila in filas:
+            row = tk.Frame(f, bg=BG_MAIN)
+            row.pack(pady=2)
+            for texto, cmd in fila:
+                tk.Button(row, text=texto, command=cmd, bg=BG_WIDGET, fg=FG_MAIN,
+                          relief="flat", padx=8, pady=4, cursor="hand2",
+                          font=("Helvetica", 9)).pack(side="left", padx=4)
+
+    def _build_log(self):
+        f = tk.LabelFrame(self.left, text=" Log ", font=("Helvetica", 9, "bold"),
+                          fg=FG_MAIN, bg=BG_MAIN, bd=1, relief="solid", padx=6, pady=6)
+        f.pack(fill="both", expand=True)
+        self.log_text = tk.Text(f, height=6, bg=BG_LOG, fg=FG_MAIN,
+                                insertbackground=FG_MAIN, font=("Courier", 8),
+                                relief="flat", state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+    def _build_3d(self):
+        tk.Label(self.right, text="Vista 3D del brazo", font=("Helvetica", 12, "bold"),
+                 fg=FG_MAIN, bg=BG_MAIN).pack(pady=(0, 2))
+        self.fig = plt.Figure(figsize=(5.4, 5.4), facecolor=BG_PANEL)
+        self.ax = self.fig.add_subplot(111, projection="3d")
+        self._setup_ax()
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right)
+        self.canvas.get_tk_widget().configure(bg=BG_PANEL, highlightthickness=0)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self.lbl_xyz = tk.Label(self.right, text="Efector: x=0.00 y=0.00 z=0.00",
+                                font=("Courier", 9), fg=ACCENT_GREEN, bg=BG_MAIN)
+        self.lbl_xyz.pack(pady=(2, 0))
+
+    def _setup_ax(self):
+        ax = self.ax
+        ax.set_facecolor(BG_PANEL)
+        for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+            axis.pane.fill = False
+            axis.pane.set_edgecolor(GRID_COLOR)
+        ax.tick_params(colors=FG_SOFT, labelsize=7)
+        ax.set_xlabel("X", color=FG_MAIN, fontsize=8)
+        ax.set_ylabel("Y", color=FG_MAIN, fontsize=8)
+        ax.set_zlabel("Z", color=FG_MAIN, fontsize=8)
+        ax.grid(True, color=GRID_COLOR, alpha=0.45)
+        ax.set_xlim(-TOTAL, TOTAL)
+        ax.set_ylim(-TOTAL, TOTAL)
+        ax.set_zlim(0, TOTAL)
+        ax.set_title("Cinemática directa", color=FG_MAIN, fontsize=9, pad=4)
+
+    def _start_animation(self):
+        self.anim = FuncAnimation(self.fig, self._update_3d, interval=80, blit=False)
+
+    def _update_3d(self, _frame):
+        angles = [v.get() for v in self.valores]
+        fk = forward_kinematics(angles)
+        joints = fk["joints"]
+        gripper = fk["gripper"]
+
+        self.ax.cla()
+        self._setup_ax()
+
+        xs = [p[0] for p in joints]
+        ys = [p[1] for p in joints]
+        zs = [p[2] for p in joints]
+        self.ax.plot(xs, ys, [0]*len(zs), "--", color=GRID_COLOR, linewidth=1, alpha=0.5)
+
+        colores_link = [ACCENT_RED, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_BLUE]
+        for k in range(len(joints)-1):
+            p, q = joints[k], joints[k+1]
+            self.ax.plot([p[0],q[0]], [p[1],q[1]], [p[2],q[2]], "-", color=colores_link[k % len(colores_link)], linewidth=3.5)
+
+        labels = ["Base", "Hombro", "Codo", "Muñeca", "Efector"]
+        colores_j = [ACCENT_RED, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_BLUE, FG_MAIN]
+        for p, lbl, cj in zip(joints, labels, colores_j):
+            self.ax.scatter(*p, color=cj, s=55, zorder=6, edgecolors=BG_MAIN, linewidths=0.8)
+            self.ax.text(p[0], p[1], p[2]+0.18, lbl, color=FG_SOFT, fontsize=7, ha="center", va="bottom")
+
+        for ga, gb in gripper:
+            self.ax.plot([ga[0], gb[0]], [ga[1], gb[1]], [ga[2], gb[2]], "-", color=ACCENT_PURPLE, linewidth=2.5)
+
+        ef = joints[-1]
+        self.lbl_xyz.config(text=f"Efector: x={ef[0]:+.2f} y={ef[1]:+.2f} z={ef[2]:.2f}")
+        self.canvas.draw_idle()
+
+    def _aplicar_estado_brazo(self, data):
+        if not isinstance(data, dict):
+            return
+
+        if "modo" in data:
+            modo_rx = str(data["modo"]).lower().strip()
+            if modo_rx in ("manual", "mpu") and modo_rx != self.modo.get():
+                self.modo.set(modo_rx)
+                self._actualizar_estado_modo_visual()
+
+        if "angulos" in data and isinstance(data["angulos"], list):
+            angs = data["angulos"]
+            for i in range(min(NUM_SERVOS, len(angs))):
+                mn, mx = LIMITES_SERVOS[i]
+                a = max(mn, min(mx, int(angs[i])))
+                self.valores[i].set(a)
+                self.ultimo_enviado[i] = a
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, data = self.rx_queue.get_nowait()
+                if kind == "resp":
+                    try:
+                        obj = json.loads(data)
+                        self._aplicar_estado_brazo(obj)
+                        self._log("← " + obj.get("msg", "ok"))
+                    except:
+                        self._log("← " + data)
+                elif kind == "log":
+                    self._log(data)
+                elif kind == "status":
+                    if data == "connected":
+                        self.conectado = True
+                        self.lbl_estado.config(text="● Conectado", fg=ACCENT_GREEN)
+                        self.btn_conn.config(text="Desconectar", bg=ACCENT_GREEN, fg=BG_MAIN)
+                        self._log("✓ Conectado/reconectado.")
+                        self._enviar({"tipo": "config", "modo": self.modo.get()})
+                        self._pedir_estado()
+                    elif data == "disconnected":
+                        self.conectado = False
+                        self.lbl_estado.config(text="● Reconectando...", fg=ACCENT_YELLOW)
+                        self.btn_conn.config(text="Desconectar", bg=ACCENT_YELLOW, fg=BG_MAIN)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _actualizar_estado_modo_visual(self):
+        es_manual = (self.modo.get() == "manual")
+        for sl in self.sliders:
+            sl.config(state=tk.NORMAL if es_manual else tk.DISABLED)
+        self.lbl_modo_estado.config(
+            text="Modo activo: MANUAL" if es_manual else "Modo activo: MPU",
+            fg=ACCENT_YELLOW if es_manual else ACCENT_GREEN
+        )
+
+    def _toggle_conexion(self):
+        if self.client and self.auto_reconnect:
+            self.auto_reconnect = False
+            self.client.stop()
+            self.client = None
+            self.conectado = False
+            self.lbl_estado.config(text="● Desconectado", fg=ACCENT_RED)
+            self.btn_conn.config(text="Conectar", bg=ACCENT_RED, fg=FG_MAIN)
+            self._log("Desconectado.")
+            return
+
+        ip = self.ip_entry.get().strip()
+        try:
+            port = int(self.port_entry.get().strip())
+        except ValueError:
+            messagebox.showerror("Error", "Puerto inválido.")
+            return
+
+        self.client = PersistentClient(ip, port, self.rx_queue)
+        self.auto_reconnect = True
+        self.client.start()
+        self.lbl_estado.config(text="● Conectando...", fg=ACCENT_YELLOW)
+        self.btn_conn.config(text="Desconectar", bg=ACCENT_YELLOW, fg=BG_MAIN)
+        self._log("Intentando conexión...")
+
+    def _enviar(self, obj):
+        try:
+            if self.client:
+                self.client.send(obj)
+        except Exception as e:
+            self._log(f"ERROR envío: {e}")
+
+    def _cambiar_modo_desde_ui(self):
+        self._actualizar_estado_modo_visual()
+        if self.conectado:
+            self._enviar({"tipo": "config", "modo": self.modo.get()})
+            self._log(f"→ Cambio de modo a {self.modo.get().upper()}")
+            self._pedir_estado()
+
+    def _pedir_estado(self):
+        if self.conectado:
+            self._enviar({"tipo": "estado"})
+
+    def _programar_envio_slider(self, idx):
+        if self.slider_jobs[idx] is not None:
+            self.after_cancel(self.slider_jobs[idx])
+        self.slider_jobs[idx] = self.after(SLIDER_DEBOUNCE_MS, lambda i=idx: self._enviar_servo(i))
+
+    def _on_slider(self, idx, _val):
+        if self.modo.get() != "manual" or not self.conectado:
+            return
+        valor = self.valores[idx].get()
+        minimo, maximo = LIMITES_SERVOS[idx]
+        valor = max(minimo, min(maximo, valor))
+        self.valores[idx].set(valor)
+        if valor == self.ultimo_enviado[idx]:
+            return
+        self._programar_envio_slider(idx)
+
+    def _enviar_servo(self, idx):
+        self.slider_jobs[idx] = None
+        ang = self.valores[idx].get()
+        self._enviar({"tipo": "manual", "servo": idx + 1, "angulo": ang})
+        self.ultimo_enviado[idx] = ang
+        self._log(f"→ {NOMBRES_SERVOS[idx]}: {ang}°")
+
+    def _enviar_todos(self, angulos):
+        if self.modo.get() != "manual":
+            self._log("Manual bloqueado en modo MPU.")
+            return
+        angulos = list(angulos)
+        for i in range(NUM_SERVOS):
+            mn, mx = LIMITES_SERVOS[i]
+            angulos[i] = max(mn, min(mx, angulos[i]))
+            self.valores[i].set(angulos[i])
+        if self.conectado:
+            self._enviar({"tipo": "manual", "angulos": angulos})
+            self.ultimo_enviado = angulos[:]
+            self._log(f"→ Posición: {angulos}")
+
+    def _centro(self):
+        self._enviar_todos([90,90,90,90,45])
+
+    def _reposo(self):
+        self._enviar_todos([70,110,90,90,20])
+
+    def _abrir_pinza(self):
+        self.valores[4].set(90)
+        self._programar_envio_slider(4)
+
+    def _cerrar_pinza(self):
+        self.valores[4].set(0)
+        self._programar_envio_slider(4)
+
+    def _log(self, msg):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
